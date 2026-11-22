@@ -317,7 +317,7 @@ def main():
         try:
             files = patch_files(patch.read_text(encoding='utf-8'), ROOT)
             numbers = index.candidates(files)
-            if numbers and not os.environ.get('ANTALUS_STATIC'):
+            if numbers and os.environ.get('ANTALUS_DYNAMIC') == '1':
                 direct = index.direct_readers(files) & numbers
                 numbers = direct | refine(numbers - direct, files, tests, milliseconds, deadline)
         except (OSError, IndexError, ValueError, SyntaxError, RecursionError):

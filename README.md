@@ -10,4 +10,4 @@ O escalonamento compara de um a oito workers em milissegundos. O executável lê
 docker build --platform linux/amd64 -t ant-alus .
 ```
 
-Para executar a amostra, monte `sample/commits` em `/data/commits` e `sample/tests.json` em `/data/tests.json`, conforme o kit oficial. A opção `ANTALUS_STATIC=1` permite medir a seleção antes da verificação dinâmica.
+Para executar a amostra, monte `sample/commits` em `/data/commits` e `sample/tests.json` em `/data/tests.json`, conforme o kit oficial. Use `ANTALUS_DYNAMIC=1` para experimentar a verificação em subprocesso. Ela fica desativada por padrão porque o custo de CPU superou a redução da seleção na amostra.
