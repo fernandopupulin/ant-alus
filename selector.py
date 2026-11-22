@@ -114,6 +114,69 @@ def code_shape(source):
     return ast.dump(tree), functions
 
 
+def configuration_change(before, after, module):
+    """Recognize a same-shape class configuration update with a known consumer."""
+    def shape(text):
+        tree = ast.parse(text)
+        entries = {}
+
+        def walk(body, parents=()):
+            for node in body:
+                if isinstance(node, ast.ClassDef):
+                    walk(node.body, parents + (node.name,))
+                elif parents and isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+                    name = node.targets[0].id
+                    kind = (
+                        (module.startswith('sqlglot.dialects.') and name in ('WEEK_OFFSET', 'NUMERIC_ESCAPES'))
+                        or (module.startswith('sqlglot.parsers.') and name == 'SHOW_PARSERS')
+                        or (module.startswith('sqlglot.expressions.') and name == 'arg_types')
+                    )
+                    if not kind:
+                        continue
+                    if isinstance(node.value, ast.Dict):
+                        if any((key is None and name != 'SHOW_PARSERS') or
+                               (key is not None and (not isinstance(key, ast.Constant) or type(key.value) is not str))
+                               for key in node.value.keys):
+                            continue
+                        keys = tuple(key.value if key is not None else (ast.dump(value),)
+                                     for key, value in zip(node.value.keys, node.value.values))
+                    elif isinstance(node.value, (ast.Constant, ast.UnaryOp)) and name == 'WEEK_OFFSET':
+                        if type(ast.literal_eval(node.value)) is not int:
+                            continue
+                        keys = None
+                    else:
+                        continue
+                    if name == 'SHOW_PARSERS':
+                        values = [v for k, v in zip(node.value.keys, node.value.values) if k is not None]
+                        if any(not (isinstance(v, ast.Call) and isinstance(v.func, ast.Name)
+                                    and v.func.id == '_show_parser') for v in values):
+                            continue
+                        for value in values:
+                            for arg in (*value.args, *(kw.value for kw in value.keywords)):
+                                ast.literal_eval(arg)
+                    else:
+                        literal = ast.literal_eval(node.value)
+                        if name == 'arg_types' and any(type(v) is not bool for v in literal.values()):
+                            continue
+                    entries[(parents, name, keys)] = ast.dump(node.value)
+                    node.value = ast.Constant(value=None)
+
+        walk(tree.body)
+        return ast.dump(tree), entries
+
+    old, a = shape(before)
+    new, b = shape(after)
+    if old != new or a.keys() != b.keys():
+        return None
+    differences = [key for key in a if a[key] != b[key]]
+    if len(differences) != 1:
+        return None
+    parents, name, _ = differences[0]
+    if module.startswith('sqlglot.dialects.'):
+        parents = parents[:1]
+    return f'{module}:{".".join(parents)}'
+
+
 class Index:
     def __init__(self, profile, tests):
         self.profile = profile
@@ -161,6 +224,15 @@ class Index:
             old_shape, old = code_shape(before)
             new_shape, new = code_shape(after)
             if old_shape != new_shape or len(old) != len(new):
+                try:
+                    owner = configuration_change(before, after, path[:-3].replace('/', '.'))
+                except (TypeError, ValueError):
+                    owner = None
+                users = self.profile.get('class_users', {})
+                if owner is not None and owner in users:
+                    compile(after, path, 'exec')
+                    bits |= int(users[owner], 16) | self.subprocesses
+                    continue
                 return self.all
             import_calls = set(self.profile['imports'].get(path, ()))
             calls = self.profile['functions'].get(path, {})

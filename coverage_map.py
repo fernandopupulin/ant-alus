@@ -7,6 +7,7 @@ import pickle
 import sys
 from collections import defaultdict
 from concurrent import futures
+from functools import wraps
 from pathlib import Path
 
 import pytest
@@ -48,12 +49,14 @@ class Observe:
         self.setup = False
         self.ids = set()
         self.started = set()
+        self.inconclusive = set()
         self.import_calls = set()
         self.functions = defaultdict(set)
         self.setup_functions = defaultdict(set)
         self.readers = defaultdict(set)
         self.setup_readers = defaultdict(set)
         self.subprocesses = set()
+        self.class_users = defaultdict(set)
 
     def relative(self, path):
         if not isinstance(path, str):
@@ -90,6 +93,10 @@ class Observe:
 
     def pytest_collection_finish(self, session):
         self.ids.update(item.nodeid for item in session.items)
+
+    def pytest_runtest_logreport(self, report):
+        if report.failed:
+            self.inconclusive.add(report.nodeid)
 
     @pytest.hookimpl(wrapper=True, tryfirst=True)
     def pytest_runtest_protocol(self, item):
@@ -130,10 +137,35 @@ class Observe:
         for path, line in sorted(self.import_calls):
             imports[path].append(line)
         return {
-            'ids': ids, 'unobserved': bits(self.ids - self.started), 'functions': functions,
+            'ids': ids, 'unobserved': bits((self.ids - self.started) | self.inconclusive), 'functions': functions,
             'imports': imports, 'readers': {p: bits(n) for p, n in sorted(self.readers.items())},
             'subprocesses': bits(self.subprocesses),
+            'class_users': {key: bits(nodes) for key, nodes in sorted(self.class_users.items())},
         }
+
+    def record_instances(self, base):
+        original = base.__init__
+        owner_keys = {}
+        last_seen = {}
+
+        @wraps(original)
+        def init(instance, /, *args, **kwargs):
+            active = self.current
+            if active is not None:
+                kind = type(instance)
+                if last_seen.get(kind) != active:
+                    last_seen[kind] = active
+                    keys = owner_keys.get(kind)
+                    if keys is None:
+                        keys = owner_keys[kind] = tuple(
+                            f'{cls.__module__}:{cls.__qualname__}' for cls in kind.__mro__
+                            if cls.__module__.startswith('sqlglot.') and cls is not base
+                        )
+                    for key in keys:
+                        self.class_users[key].add(active)
+            return original(instance, *args, **kwargs)
+
+        base.__init__ = init
 
 
 def main():
@@ -145,6 +177,12 @@ def main():
     monitoring.register_callback(tool, monitoring.events.PY_RESUME, observer.call)
     monitoring.set_events(tool, monitoring.events.PY_START | monitoring.events.PY_RESUME)
     sys.addaudithook(observer.audit)
+    from sqlglot import exp
+    from sqlglot.dialects.dialect import Dialect
+    from sqlglot.parser import Parser
+
+    for base in (Dialect, Parser, exp.Expr):
+        observer.record_instances(base)
     pool = futures.ProcessPoolExecutor
     futures.ProcessPoolExecutor = RecordingPool
     try:
@@ -152,7 +190,7 @@ def main():
     finally:
         futures.ProcessPoolExecutor = pool
     monitoring.set_events(tool, 0)
-    if status != 0 or len(observer.started) < 1000:
+    if status not in (0, 1) or len(observer.started) != len(observer.ids):
         raise SystemExit('Could not measure the complete pinned suite')
     with gzip.open(sys.argv[1], 'wt', encoding='utf-8') as file:
         json.dump(observer.export(), file, separators=(',', ':'))
