@@ -10,4 +10,4 @@ O escalonamento compara de um a oito workers em milissegundos. O executável lê
 docker build --platform linux/amd64 -t ant-alus .
 ```
 
-Para executar a amostra, monte `sample/commits` em `/data/commits` e `sample/tests.json` em `/data/tests.json`, conforme o kit oficial. Use `ANTALUS_DYNAMIC=1` para experimentar a verificação em subprocesso. Ela fica desativada por padrão porque o custo de CPU superou a redução da seleção na amostra.
+Para executar a amostra, monte `sample/commits` em `/data/commits` e `sample/tests.json` em `/data/tests.json`, conforme o kit oficial. O seletor tenta uma única execução local por diff de código quando pode dispensar todos os workers desse diff com uma checagem barata. O lote de verificação tem no máximo seis testes e a janela de reexecução dura até seis segundos no total. Use `ANTALUS_STATIC=1` para medir apenas a seleção por cobertura.

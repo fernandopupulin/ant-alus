@@ -287,10 +287,6 @@ def schedule(numbers, milliseconds):
     return best
 
 
-def schedule_cost(groups, milliseconds):
-    return max((sum(milliseconds[n] for n in group) for group in groups), default=0) + FEE * len(groups)
-
-
 def materialize(source, target, edits):
     """Make a small private source overlay without copying the unchanged tree."""
     if not edits:
@@ -307,20 +303,21 @@ def materialize(source, target, edits):
             materialize(child, target / child.name, children.get(child.name, {}))
 
 
-def refine(selected, files, tests, milliseconds, deadline):
-    """Use remaining test reports as positive proof of passage for cheap candidates."""
-    if not selected or len(selected) > 220:
+def refine(selected, protected, files, tests, milliseconds, deadline):
+    """Verify one small group when it can repay the cost of starting pytest."""
+    if not selected or any(not p.startswith('sqlglot/') or not p.endswith('.py') for p in files):
         return selected
-    if any(not path.startswith('sqlglot/') or not path.endswith('.py') for path in files):
-        return selected
-    ordered = sorted(selected, key=lambda n: (milliseconds[n], n))
-    ready = [n for n in ordered if milliseconds[n] <= 5500]
-    ready = ready[:90]
-    if not ready or time.monotonic() + 2 >= deadline:
-        return selected
-    without = selected - set(ready)
-    potential = schedule_cost(schedule(selected, milliseconds), milliseconds) - schedule_cost(schedule(without, milliseconds), milliseconds)
-    if potential < 1000:
+    ready = []
+    used = 0
+    for n in sorted(selected - protected, key=lambda n: (milliseconds[n], n)):
+        # A fixed allowance covers dispatch overhead even for zero-ms tests.
+        used += milliseconds[n] + 20
+        if used > 600 or len(ready) == 6:
+            break
+        ready.append(n)
+    # These runs only pay when all candidates fit the small local budget and
+    # every passing verdict together can eliminate the entire worker fee.
+    if not ready or len(ready) != len(selected) or time.monotonic() + 1 >= deadline:
         return selected
     edits = {path: after for path, (_, after) in files.items()}
     with tempfile.TemporaryDirectory(dir='/tmp') as temporary:
@@ -337,7 +334,7 @@ def refine(selected, files, tests, milliseconds, deadline):
                 start_new_session=True,
             )
             try:
-                status = proc.wait(timeout=max(0, min(6.0, deadline - time.monotonic())))
+                status = proc.wait(timeout=max(0, min(2.5, deadline - time.monotonic())))
             except subprocess.TimeoutExpired:
                 try:
                     os.killpg(proc.pid, signal.SIGKILL)
@@ -383,15 +380,17 @@ def main():
     with gzip.open(APP / 'coverage.json.gz', 'rt', encoding='utf-8') as stream:
         index = Index(json.load(stream), tests)
     milliseconds = [round(t['seconds'] * 1000) for t in tests]
-    deadline = started + 70
+    deadline = started + 6
     patches = sorted((DATA / 'commits').glob('*.patch'))
     for patch in patches:
         try:
             files = patch_files(patch.read_text(encoding='utf-8'), ROOT)
             numbers = index.candidates(files)
-            if numbers and os.environ.get('ANTALUS_DYNAMIC') == '1':
-                direct = index.direct_readers(files) & numbers
-                numbers = direct | refine(numbers - direct, files, tests, milliseconds, deadline)
+            if not os.environ.get('ANTALUS_STATIC'):
+                protected = set(index.unmapped)
+                if any(path.startswith('sqlglot/') for path in files):
+                    protected.update(index.direct_readers(files))
+                numbers = refine(numbers, protected, files, tests, milliseconds, deadline)
         except (OSError, IndexError, ValueError, SyntaxError, RecursionError):
             numbers = index.all
         print(json.dumps({'commit': patch.stem, 'workers': schedule(numbers, milliseconds)}, separators=(',', ':')), flush=True)
