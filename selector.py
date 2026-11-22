@@ -13,6 +13,7 @@ import tempfile
 import time
 from pathlib import Path
 
+from comparisons import boolean_swap, numeric_edit, single_swap
 
 ROOT = Path('/src')
 APP = Path('/app')
@@ -77,7 +78,7 @@ def patch_files(text, root):
             if index < len(lines) and lines[index].startswith('\\ No newline'):
                 raise ValueError('unsupported line-ending change')
         contents.extend(original[cursor:])
-        files[path] = (source, '\n'.join(contents))
+        files[path] = (source, '\n'.join(contents) + ('\n' if source.endswith('\n') else ''))
     if not files:
         raise ValueError('empty diff')
     return files
@@ -174,7 +175,7 @@ def configuration_change(before, after, module):
     parents, name, _ = differences[0]
     if module.startswith('sqlglot.dialects.'):
         parents = parents[:1]
-    return f'{module}:{".".join(parents)}'
+    return f'{module}:{".".join(parents)}', name
 
 
 class Index:
@@ -190,6 +191,10 @@ class Index:
         self.all = set(numbered.values())
         self.unobserved = int(profile['unobserved'], 16)
         self.subprocesses = int(profile['subprocesses'], 16)
+        self.import_probes = int(profile.get('import_probes', '0'), 16)
+        self.import_readers = profile.get('import_readers', {})
+        paths = profile.get('import_paths')
+        self.import_paths = set(paths) if paths else None
 
     def numbers(self, bits):
         numbers = set()
@@ -210,6 +215,9 @@ class Index:
     def candidates(self, files):
         bits = 0
         direct = self.direct_readers(files)
+        subprocesses = self.subprocesses
+        if self.import_paths is None or self.import_paths.intersection(files):
+            subprocesses |= self.import_probes
         for path, (before, after) in files.items():
             if path == 'tests/conftest.py' or not path.startswith(('tests/', 'sqlglot/')):
                 return self.all
@@ -219,20 +227,48 @@ class Index:
                 direct.update(self.files[path])
                 continue
             if not path.endswith('.py'):
-                bits |= self.subprocesses
+                bits |= subprocesses
                 continue
+            compile(after, path, 'exec')
+            if path in self.import_readers:
+                old_ast = ast.dump(ast.parse(before))
+                new_ast = ast.dump(ast.parse(after))
+                if old_ast != new_ast:
+                    bits |= int(self.import_readers[path], 16)
+            lines = self.profile.get('branch_lines', {})
+            if len(files) == 1 and lines and path.startswith('sqlglot/parsers/'):
+                key = f'{path}:{boolean_swap(before, after)}'
+                if key in lines:
+                    bits |= int(lines[key], 16) | subprocesses
+                    continue
+            risks = self.profile.get('comparison_risks', {})
+            if len(files) == 1 and risks and path.startswith(('sqlglot/dialects/', 'sqlglot/executor/')):
+                key = single_swap(before, after)
+                if key is not None and f'{path}:{key}' in risks:
+                    bits |= int(risks[f'{path}:{key}'], 16) | subprocesses
+                    continue
             old_shape, old = code_shape(before)
             new_shape, new = code_shape(after)
             if old_shape != new_shape or len(old) != len(new):
+                tables = self.profile.get('numeric_tables', ())
+                if len(files) == 1 and tables and path.startswith('sqlglot/dialects/'):
+                    escape = numeric_edit(before, after)
+                    if escape is not None and escape[0] in tables and repr(escape) not in self.profile['numeric_shared']:
+                        bits |= int(self.profile['numeric_users'].get(repr(escape), '0'), 16) | subprocesses
+                        continue
                 try:
-                    owner = configuration_change(before, after, path[:-3].replace('/', '.'))
+                    config = configuration_change(before, after, path[:-3].replace('/', '.'))
                 except (TypeError, ValueError):
-                    owner = None
-                users = self.profile.get('class_users', {})
-                if owner is not None and owner in users:
-                    compile(after, path, 'exec')
-                    bits |= int(users[owner], 16) | self.subprocesses
-                    continue
+                    config = None
+                if config is not None:
+                    owner, name = config
+                    users = self.profile.get('class_users', {})
+                    attribute_users = self.profile.get('week_users', {})
+                    if name == 'WEEK_OFFSET' and len(files) == 1 and owner in attribute_users:
+                        users = attribute_users
+                    if owner in users:
+                        bits |= int(users[owner], 16) | subprocesses
+                        continue
                 return self.all
             import_calls = set(self.profile['imports'].get(path, ()))
             calls = self.profile['functions'].get(path, {})
@@ -241,7 +277,7 @@ class Index:
                     continue
                 if line in import_calls:
                     return self.all
-                bits |= int(calls.get(str(line), '0'), 16) | self.subprocesses
+                bits |= int(calls.get(str(line), '0'), 16) | subprocesses
         return direct | self.numbers(bits)
 
 
@@ -303,21 +339,12 @@ def materialize(source, target, edits):
             materialize(child, target / child.name, children.get(child.name, {}))
 
 
-def refine(selected, protected, files, tests, milliseconds, deadline):
+def refine(selected, protected, files, tests, milliseconds):
     """Verify one small group when it can repay the cost of starting pytest."""
-    if not selected or any(not p.startswith('sqlglot/') or not p.endswith('.py') for p in files):
+    if (not selected or selected & protected or len(selected) > 40
+            or any(not p.startswith('sqlglot/') or not p.endswith('.py') for p in files)):
         return selected
-    ready = []
-    used = 0
-    for n in sorted(selected - protected, key=lambda n: (milliseconds[n], n)):
-        # A fixed allowance covers dispatch overhead even for zero-ms tests.
-        used += milliseconds[n] + 20
-        if used > 600 or len(ready) == 6:
-            break
-        ready.append(n)
-    # These runs only pay when all candidates fit the small local budget and
-    # every passing verdict together can eliminate the entire worker fee.
-    if not ready or len(ready) != len(selected) or time.monotonic() + 1 >= deadline:
+    if sum(milliseconds[n] + 5 for n in selected) > 1100:
         return selected
     edits = {path: after for path, (_, after) in files.items()}
     with tempfile.TemporaryDirectory(dir='/tmp') as temporary:
@@ -325,7 +352,7 @@ def refine(selected, protected, files, tests, milliseconds, deadline):
         source = temp / 'tree'
         result = temp / 'result.json'
         materialize(ROOT, source, edits)
-        ids = [tests[n]['id'] for n in ready]
+        ids = [tests[n]['id'] for n in sorted(selected)]
         env = {**os.environ, 'PYTHONPATH': str(source)}
         try:
             proc = subprocess.Popen(
@@ -334,7 +361,7 @@ def refine(selected, protected, files, tests, milliseconds, deadline):
                 start_new_session=True,
             )
             try:
-                status = proc.wait(timeout=max(0, min(2.5, deadline - time.monotonic())))
+                status = proc.wait(timeout=2.5)
             except subprocess.TimeoutExpired:
                 try:
                     os.killpg(proc.pid, signal.SIGKILL)
@@ -344,7 +371,7 @@ def refine(selected, protected, files, tests, milliseconds, deadline):
                 return selected
             if status in (0, 1) and result.is_file():
                 passed = set(json.loads(result.read_bytes()))
-                return selected - {n for n in ready if tests[n]['id'] in passed}
+                return {n for n in selected if tests[n]['id'] not in passed}
         except (OSError, ValueError):
             pass
     return selected
@@ -380,7 +407,6 @@ def main():
     with gzip.open(APP / 'coverage.json.gz', 'rt', encoding='utf-8') as stream:
         index = Index(json.load(stream), tests)
     milliseconds = [round(t['seconds'] * 1000) for t in tests]
-    deadline = started + 6
     patches = sorted((DATA / 'commits').glob('*.patch'))
     for patch in patches:
         try:
@@ -390,7 +416,7 @@ def main():
                 protected = set(index.unmapped)
                 if any(path.startswith('sqlglot/') for path in files):
                     protected.update(index.direct_readers(files))
-                numbers = refine(numbers, protected, files, tests, milliseconds, deadline)
+                numbers = refine(numbers, protected, files, tests, milliseconds)
         except (OSError, IndexError, ValueError, SyntaxError, RecursionError):
             numbers = index.all
         print(json.dumps({'commit': patch.stem, 'workers': schedule(numbers, milliseconds)}, separators=(',', ':')), flush=True)

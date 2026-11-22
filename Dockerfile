@@ -7,10 +7,11 @@ RUN python -m pip install --no-cache-dir --no-deps -r /tmp/requirements.lock
 ADD https://codeload.github.com/tobymao/sqlglot/tar.gz/eb11aec4be8cb2122afe713a4816662c3f0fb2fa /tmp/sqlglot.tar.gz
 RUN mkdir /src /app && tar -xzf /tmp/sqlglot.tar.gz --strip-components=1 -C /src \
     && rm /tmp/sqlglot.tar.gz /tmp/requirements.lock
-COPY coverage_map.py /app/coverage_map.py
+COPY coverage_map.py comparisons.py /app/
 WORKDIR /src
 RUN PYTHONPATH=/src python /app/coverage_map.py /app/coverage.json.gz
 
 FROM observations AS selector
+RUN python -m compileall -q --invalidation-mode checked-hash /src/sqlglot /src/tests
 COPY selector.py /app/selector.py
 CMD ["python", "/app/selector.py"]
